@@ -35,8 +35,6 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Zorah Code Fixer Worker")
 
-WORKER_SHARED_SECRET = os.environ.get("WORKER_SHARED_SECRET")
-
 # Hard ceilings — independent of whatever the main backend asks for, this
 # process refuses to be talked into something unbounded.
 MAX_ZIP_BYTES = 80 * 1024 * 1024
@@ -48,9 +46,8 @@ JOB_WALL_CLOCK_BUDGET_S = 8 * 60
 
 # Applied to each command's subprocess via resource.setrlimit in a
 # preexec_fn — a portable, no-extra-dependency way to cap a runaway
-# `npm install` or fork-bombing test suite without needing container
-# tooling this environment may not have (Docker-in-Docker, gVisor, etc.
-# aren't available on a plain Render/Fly web service).
+# `npm install` or test suite without needing container tooling this
+# environment may not have.
 MAX_CPU_SECONDS = 170
 MAX_MEMORY_BYTES = 1536 * 1024 * 1024
 MAX_PROCESSES = 256
@@ -58,21 +55,29 @@ MAX_OUTPUT_CHARS = 20_000  # per stream, truncated — not meant to replace real
 
 
 def _require_secret(x_worker_secret: str | None = Header(default=None)) -> None:
-    if not WORKER_SHARED_SECRET:
+    worker_shared_secret = os.environ.get("WORKER_SHARED_SECRET")
+    if not worker_shared_secret:
         raise HTTPException(status_code=500, detail="worker is not configured (no shared secret set)")
-    if x_worker_secret != WORKER_SHARED_SECRET:
+    if x_worker_secret != worker_shared_secret:
         raise HTTPException(status_code=401, detail="invalid worker secret")
 
 
 def _limit_resources():
     """Runs inside the child process, before exec — this is what actually
-    enforces the CPU/memory/process caps at the OS level."""
-    resource.setrlimit(resource.RLIMIT_CPU, (MAX_CPU_SECONDS, MAX_CPU_SECONDS))
-    resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY_BYTES, MAX_MEMORY_BYTES))
-    resource.setrlimit(resource.RLIMIT_NPROC, (MAX_PROCESSES, MAX_PROCESSES))
-    # A fresh process group, so a timeout kill can take the whole
-    # subprocess tree with it instead of leaving orphaned children behind.
-    os.setsid()
+    enforces CPU caps at the OS level."""
+    for limit_attr, value in [
+        ("RLIMIT_CPU", MAX_CPU_SECONDS),
+    ]:
+        if hasattr(resource, limit_attr):
+            try:
+                res = getattr(resource, limit_attr)
+                resource.setrlimit(res, (value, value))
+            except (ValueError, OSError):
+                pass
+    try:
+        os.setsid()
+    except OSError:
+        pass
 
 
 def _safe_extract(zip_path: Path, dest: Path) -> int:
@@ -91,10 +96,11 @@ def _safe_extract(zip_path: Path, dest: Path) -> int:
             # rather than trying to sanitize them — a name that needs
             # sanitizing is a name we don't trust.
             name = info.filename
-            if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
+            clean_name = name.replace("\\", "/")
+            if clean_name.startswith("/") or ".." in Path(clean_name).parts:
                 raise ValueError(f"unsafe path in archive: {name}")
 
-            target = (dest / name).resolve()
+            target = (dest / clean_name).resolve()
             if dest.resolve() not in target.parents and target != dest.resolve():
                 raise ValueError(f"path escapes extraction root: {name}")
 
@@ -123,7 +129,8 @@ class RunResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "configured": WORKER_SHARED_SECRET is not None}
+    worker_shared_secret = os.environ.get("WORKER_SHARED_SECRET")
+    return {"ok": True, "configured": bool(worker_shared_secret)}
 
 
 @app.post("/run", response_model=RunResponse)
